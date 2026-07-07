@@ -1,4 +1,6 @@
-use hidapi::{HidApi, HidError};
+use std::cmp::Ordering;
+
+use hidapi::{DeviceInfo, HidApi, HidError};
 use thiserror::Error;
 
 const VID: u16 = 0x046d;
@@ -16,56 +18,66 @@ pub enum KeyMode {
     MediaKeys,
 }
 
+impl KeyMode {
+    fn report(self) -> &'static [u8; 7] {
+        match self {
+            Self::FunctionKeys => &FUNCTION_KEYS_REPORT,
+            Self::MediaKeys => &MEDIA_KEYS_REPORT,
+        }
+    }
+}
+
 #[derive(Debug, Error)]
-pub enum Error {
+pub enum ModeSwitchError {
     #[error("Logitech K380 HID interface not found")]
     DeviceNotFound,
 
     #[error("HID operation failed: {0}")]
     Hid(#[from] HidError),
 
-    #[error("incomplete HID write: expected {expected} bytes, wrote {actual}")]
-    ShortWrite { expected: usize, actual: usize },
+    #[error("unexpected HID write length: expected {expected} bytes, wrote {actual}")]
+    UnexpectedWriteLength { expected: usize, actual: usize },
 }
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub type ModeSwitchResult<T> = std::result::Result<T, ModeSwitchError>;
 
-pub fn set_key_mode(mode: KeyMode) -> Result<()> {
-    let api = HidApi::new()?;
+pub struct K380ModeSwitcher {
+    api: HidApi,
+}
 
-    let info = api
-        .device_list()
-        .find(|device| {
-            device.vendor_id() == VID
-                && device.product_id() == PID
-                && device.usage() == USAGE
-                && device.usage_page() == USAGE_PAGE
+impl K380ModeSwitcher {
+    pub fn new() -> ModeSwitchResult<Self> {
+        Ok(Self {
+            api: HidApi::new()?,
         })
-        .ok_or(Error::DeviceNotFound)?;
-
-    let device = info.open_device(&api)?;
-
-    let report = match mode {
-        KeyMode::FunctionKeys => &FUNCTION_KEYS_REPORT,
-        KeyMode::MediaKeys => &MEDIA_KEYS_REPORT,
-    };
-
-    let actual = device.write(report)?;
-
-    if actual != report.len() {
-        return Err(Error::ShortWrite {
-            expected: report.len(),
-            actual,
-        });
     }
 
-    Ok(())
+    pub fn set_key_mode(&mut self, mode: KeyMode) -> ModeSwitchResult<()> {
+        self.api.refresh_devices()?;
+
+        let info = self
+            .api
+            .device_list()
+            .find(|device| is_k380_config_interface(device))
+            .ok_or(ModeSwitchError::DeviceNotFound)?;
+
+        let device = info.open_device(&self.api)?;
+        let report = mode.report();
+        let actual = device.write(report)?;
+
+        match actual.cmp(&report.len()) {
+            Ordering::Equal => Ok(()),
+            _ => Err(ModeSwitchError::UnexpectedWriteLength {
+                expected: report.len(),
+                actual,
+            }),
+        }
+    }
 }
 
-pub fn set_function_keys() -> Result<()> {
-    set_key_mode(KeyMode::FunctionKeys)
-}
-
-pub fn set_media_keys() -> Result<()> {
-    set_key_mode(KeyMode::MediaKeys)
+fn is_k380_config_interface(device: &DeviceInfo) -> bool {
+    device.vendor_id() == VID
+        && device.product_id() == PID
+        && device.usage() == USAGE
+        && device.usage_page() == USAGE_PAGE
 }
